@@ -1,0 +1,253 @@
+-- уровни изоляции транзакций
+-- создадим БД для тестов
+-- https://www.postgresql.org/docs/16/sql-set-transaction.html
+CREATE DATABASE iso;
+\c iso
+
+\echo :AUTOCOMMIT
+SELECT txid_current();
+-- список БД
+\l
+SELECT current_database();
+CREATE TABLE test (i serial, amount int);
+INSERT INTO test(amount) VALUES (1000);
+INSERT INTO test(amount) VALUES (2000);
+SELECT * FROM test;
+
+
+\set AUTOCOMMIT OFF
+show transaction isolation level;
+set transaction isolation level read committed;
+-- ERROR:  SET TRANSACTION ISOLATION LEVEL must be called before any query
+set transaction isolation level repeatable read;
+set transaction isolation level serializable;
+SELECT txid_current();
+\set AUTOCOMMIT ON
+SELECT txid_current();
+SELECT * FROM test;
+
+-- глобально можно изменить
+-- ALTER DATABASE <db name> SET DEFAULT_TRANSACTION_ISOLATION TO 'read committed';
+-- set the default_transaction_isolation parameter appropriately, 
+-- either in postgresql.conf or with ALTER SYSTEM. After reloading, this will apply to the whole cluster.
+-- You can also use ALTER DATABASE or ALTER ROLE to change the setting for a database or user only.
+
+
+-- test TRANSACTION ISOLATION LEVEL READ COMMITTED;
+-- 1 console
+BEGIN;
+SELECT * FROM test;
+
+-- 2 consoleapp=# 
+-- sudo -u postgres psql
+\c iso
+BEGIN;
+UPDATE test set amount = 777 WHERE i = 1;
+COMMIT;
+
+-- 1 console
+SELECT * FROM test; -- different values
+COMMIT;
+
+
+-- TRANSACTION ISOLATION LEVEL REPEATABLE READ;
+-- 1 console
+BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ;
+SELECT * FROM test;
+ 
+-- 2 console
+BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ;
+INSERT INTO test VALUES (888);
+COMMIT;
+
+-- 1 console
+SELECT * FROM test;
+ 
+
+
+-- посмотрим на аномалию сериализации
+-- TRANSACTION ISOLATION LEVEL SERIALIZABLE;
+DROP TABLE IF EXISTS testS;
+CREATE TABLE testS (i int, amount int);
+INSERT INTO TESTS VALUES (1,10), (1,20), (2,100), (2,200); 
+
+
+-- 1 console
+BEGIN TRANSACTION ISOLATION LEVEL SERIALIZABLE;
+SELECT sum(amount) FROM testS WHERE i = 1;
+INSERT INTO testS VALUES (2,30);
+
+-- 2 consol
+BEGIN TRANSACTION ISOLATION LEVEL SERIALIZABLE;
+SELECT sum(amount) FROM testS WHERE i = 2;
+INSERT INTO testS VALUES (1,300);
+
+-- 1 console 
+COMMIT;
+
+-- 2 console 
+COMMIT;
+
+
+-- то же самое на RR
+-- 1 console
+BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ;
+SELECT sum(amount) FROM testS WHERE i = 1;
+INSERT INTO testS VALUES (2,30);
+
+-- 2 consol
+BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ;
+SELECT sum(amount) FROM testS WHERE i = 2;
+INSERT INTO testS VALUES (1,300);
+
+-- 1 console 
+COMMIT;
+
+-- 2 console 
+COMMIT;
+
+
+-- MVCC
+-- sudo -u postgres psql
+
+DROP TABLE IF EXISTS test;
+CREATE TABLE test(i int);
+INSERT INTO test VALUES (100),(200),(300);
+
+SELECT relname, n_live_tup, n_dead_tup, trunc(100*n_dead_tup/(n_live_tup+1))::float "ratio%", last_autovacuum FROM pg_stat_user_tables WHERE relname = 'test';
+
+UPDATE test set i = 201 WHERE i = 200;
+
+table test;
+
+-- посмотрим что теперь
+SELECT relname, n_live_tup, n_dead_tup, trunc(100*n_dead_tup/(n_live_tup+1))::float "ratio%", last_autovacuum FROM pg_stat_user_tables WHERE relname = 'test';
+
+
+SELECT xmin,xmax,cmin,cmax,ctid FROM test;
+CREATE EXTENSION pageinspect;
+\dx+
+SELECT lp as tuple, t_xmin, t_xmax, t_field3 as t_cid, t_ctid FROM heap_page_items(get_raw_page('test',0));
+
+-- практика по транзакциям
+DROP TABLE IF EXISTS tbl;
+CREATE TABLE IF NOT EXISTS tbl (i int);
+
+-- drop procedure insert_data();
+CREATE or replace PROCEDURE insert_data(a int)
+AS $$
+BEGIN
+    FOR I in 1..10000 LOOP
+        INSERT INTO tbl VALUES (I);
+        IF a = 1 THEN 
+            COMMIT; 
+        END IF;
+    END LOOP;
+END;
+$$ LANGUAGE plpgsql;
+
+
+-- вызовем процедуру используя CALL
+\timing
+begin;
+CALL insert_data(1);
+commit;
+
+CALL insert_data(0);
+
+-- Буферный кеш
+-- проверим размер кеша
+SELECT setting, unit FROM pg_settings WHERE name = 'shared_buffers'; 
+-- уменьшим количество буферов для наблюдения
+ALTER SYSTEM SET shared_buffers = 300;
+
+-- рестартуем кластер после изменений
+select pg_reload_conf();
+-- pg_ctlcluster 16 main stop && pg_ctlcluster 16 main start
+
+DROP TABLE IF EXISTS test;
+CREATE TABLE test(i int);
+
+-- сгенерируем значения
+INSERT INTO test SELECT s.id FROM generate_series(1,150) AS s(id); 
+SELECT * FROM test limit 10;
+
+-- создадим расширение для просмотра кеша
+CREATE EXTENSION pg_buffercache; 
+
+\dx+
+
+CREATE VIEW pg_buffercache_v AS
+SELECT bufferid,
+       (SELECT c.relname FROM pg_class c WHERE  pg_relation_filenode(c.oid) = b.relfilenode ) relname,
+       CASE relforknumber
+         WHEN 0 THEN 'main'
+         WHEN 1 THEN 'fsm'
+         WHEN 2 THEN 'vm'
+       END relfork,
+       relblocknumber,
+       isdirty,
+       usagecount
+FROM   pg_buffercache b
+WHERE  b.relDATABASE IN (    0, (SELECT oid FROM pg_DATABASE WHERE datname = current_database()) )
+AND    b.usagecount is not null;
+
+SELECT * FROM pg_buffercache_v WHERE relname='test';
+
+SELECT * FROM test limit 10;
+
+UPDATE test set i = 2 WHERE i = 1;
+
+-- увидим грязную страницу
+SELECT * FROM pg_buffercache_v WHERE relname='test';
+
+-- сделаем чекпойнт
+checkpoint;
+
+-- увидим страницу в кеше, но она будет уже чистой
+SELECT * FROM pg_buffercache_v WHERE relname='test';
+
+
+-- даст пищу для размышлений над использованием кеша -- usagecount > 3
+SELECT c.relname,
+  count(*) blocks,
+  round( 100.0 * 8192 * count(*) / pg_TABLE_size(c.oid) ) "% of rel",
+  round( 100.0 * 8192 * count(*) FILTER (WHERE b.usagecount > 3) / pg_TABLE_size(c.oid) ) "% hot"
+FROM pg_buffercache b
+  JOIN pg_class c ON pg_relation_filenode(c.oid) = b.relfilenode
+WHERE  b.relDATABASE IN (
+         0, (SELECT oid FROM pg_DATABASE WHERE datname = current_database())
+       )
+AND    b.usagecount is not null
+GROUP BY c.relname, c.oid
+ORDER BY 2 DESC
+LIMIT 10;
+
+-- сгенерируем значения с текстовыми полями - чтобы занять больше страниц
+DROP TABLE IF EXISTS test_text;
+CREATE TABLE test_text(t text);
+INSERT INTO test_text SELECT 'string '||s.id FROM generate_series(1,100000) AS s(id); 
+SELECT * FROM test_text limit 10;
+SELECT * FROM test_text;
+SELECT * FROM pg_buffercache_v WHERE relname='test_text';
+
+-- интересный эффект
+vacuum test_text;
+
+checkpoint;
+
+-- посмотрим на прогрев кеша
+-- рестартуем кластер для очистки буферного кеша
+pg_ctlcluster 16 main restart
+
+psql
+SELECT * FROM pg_buffercache_v WHERE relname='test_text';
+CREATE EXTENSION pg_prewarm;
+SELECT pg_prewarm('test_text');
+SELECT * FROM pg_buffercache_v WHERE relname='test_text';
+
+-- Buffer Manager
+-- https://www.interdb.jp/pg/pgsql08.html
+
+-- список менеджеров
+/usr/lib/postgresql/16/bin/pg_waldump -r list 
